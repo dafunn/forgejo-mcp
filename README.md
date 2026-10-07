@@ -17,6 +17,7 @@ Configured entirely from the environment.
 | `FORGEJO_TOKEN_CMD_TIMEOUT` | `30` | Seconds to wait for the token command |
 | `FORGEJO_USER` | - | If set, authenticate with HTTP Basic instead of the `token` scheme |
 | `FORGEJO_DEFAULT_REPO` | - | `owner/name` used when a tool's `repo` argument is omitted |
+| `REPO_ALLOWLIST` | - | Comma-separated `owner/name` entries. When set, only these repos can be read (case-insensitive); any other repo is refused before a request is made. `FORGEJO_DEFAULT_REPO`, if set, must be on the list |
 | `FORGEJO_VERIFY_TLS` | `true` | Set `false` to skip certificate verification |
 | `FORGEJO_TIMEOUT` | `30` | Per-request timeout in seconds |
 | `MCP_TRANSPORT` | `stdio` | `sse` to serve over HTTP instead of a spawned pipe |
@@ -47,6 +48,8 @@ so the token is never in a file or a client config. Example commands:
 | `systemd-creds` | `systemd-creds decrypt /etc/creds/forgejo.cred -` |
 
 The server only issues GETs against `/actions/*`, so a read-only token is enough.
+When the token can see more repos than the deployment should read, set
+`REPO_ALLOWLIST`: it is the boundary the server enforces, whatever the token can reach.
 
 ## Tools
 

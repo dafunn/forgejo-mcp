@@ -9,6 +9,8 @@ Configured from the environment:
     FORGEJO_USER          if set, authenticate with HTTP Basic instead of the
                           `token` scheme
     FORGEJO_DEFAULT_REPO  owner/name used when a tool's `repo` arg is omitted
+    REPO_ALLOWLIST        comma-separated owner/name entries; when set, only these
+                          repos can be read, matched case-insensitively
     FORGEJO_VERIFY_TLS    "false" to skip verification (default true)
     FORGEJO_TIMEOUT       per-request seconds (default 30)
 
@@ -36,6 +38,33 @@ DEFAULT_REPO = os.getenv("FORGEJO_DEFAULT_REPO", "")
 VERIFY_TLS = os.getenv("FORGEJO_VERIFY_TLS", "true").lower() not in ("false", "0", "no")
 TIMEOUT = float(os.getenv("FORGEJO_TIMEOUT", "30"))
 TOKEN_CMD_TIMEOUT = float(os.getenv("FORGEJO_TOKEN_CMD_TIMEOUT", "30"))
+# How many recent runs are searched when resolving a run number or a job id.
+RUN_WINDOW = 100
+
+
+def _parse_allowlist(raw: str) -> frozenset[str]:
+    """Case-folded set of the owner/name entries in `raw`; empty means no restriction.
+
+    Fails at import so a typo cannot silently leave the server unrestricted: a value
+    with anything but whitespace in it must yield at least one entry.
+    """
+    out = set()
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        parts = entry.split("/")
+        if len(parts) != 2 or not all(parts) or ".." in entry:
+            raise RuntimeError(f"REPO_ALLOWLIST entry {entry!r} is not 'owner/name'")
+        out.add(entry.casefold())
+    if raw.strip() and not out:
+        raise RuntimeError(f"REPO_ALLOWLIST {raw.strip()!r} contains no owner/name entries")
+    return frozenset(out)
+
+
+REPO_ALLOWLIST = _parse_allowlist(os.getenv("REPO_ALLOWLIST", ""))
+_default = DEFAULT_REPO.strip().strip("/")
+if REPO_ALLOWLIST and _default and _default.casefold() not in REPO_ALLOWLIST:
+    raise RuntimeError(f"FORGEJO_DEFAULT_REPO {_default!r} is not in REPO_ALLOWLIST")
 
 app = MCPServer("forgejo-mcp")
 
@@ -106,6 +135,8 @@ def _repo(repo: str) -> str:
         raise ValueError(
             f"repo must be 'owner/name' (got {r!r}); set FORGEJO_DEFAULT_REPO or pass repo="
         )
+    if REPO_ALLOWLIST and (".." in r or r.casefold() not in REPO_ALLOWLIST):
+        raise ValueError(f"repo {r!r} is not in REPO_ALLOWLIST")
     return r
 
 
@@ -130,10 +161,30 @@ def _find_run(repo: str, run_number: int) -> dict[str, Any] | None:
 
     `/actions/tasks` is not used: its `id` is a task id, not a run id.
     """
-    for r in _runs(repo, 100):
+    for r in _runs(repo, RUN_WINDOW):
         if r.get("index_in_repo") == run_number:
             return r
     return None
+
+
+def _jobs(repo: str, run_id: Any) -> list[dict[str, Any]]:
+    jobs = _get(f"/api/v1/repos/{repo}/actions/runs/{run_id}/jobs").json()
+    if isinstance(jobs, dict):
+        jobs = jobs.get("workflow_jobs") or jobs.get("jobs") or []
+    return jobs
+
+
+def _job_in_recent_runs(repo: str, job_id: int) -> bool:
+    """Whether `job_id` belongs to one of the repo's recent runs.
+
+    Used when an allowlist is set, so a job id is never read through an allowed
+    repo's path on the assumption that the forge rejects ids from other repos.
+    """
+    return any(
+        j.get("id") == job_id
+        for run in _runs(repo, RUN_WINDOW)
+        for j in _jobs(repo, run["id"])
+    )
 
 
 def _fmt_run(r: dict[str, Any]) -> str:
@@ -160,10 +211,8 @@ def forgejo_run_info(repo: str = "", run_number: int = 0) -> str:
     rp = _repo(repo)
     r = _find_run(rp, run_number)
     if not r:
-        return f"No run #{run_number} in the last 100 runs of {rp}."
-    jobs = _get(f"/api/v1/repos/{rp}/actions/runs/{r['id']}/jobs").json()
-    if isinstance(jobs, dict):
-        jobs = jobs.get("workflow_jobs") or jobs.get("jobs") or []
+        return f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}."
+    jobs = _jobs(rp, r["id"])
     lines = [
         f"Run #{r.get('index_in_repo')} (id {r['id']}) - {r.get('status')}",
         f"  workflow: {r.get('workflow_id')}",
@@ -182,10 +231,8 @@ def forgejo_run_jobs(repo: str = "", run_number: int = 0) -> str:
     rp = _repo(repo)
     r = _find_run(rp, run_number)
     if not r:
-        return f"No run #{run_number} in the last 100 runs of {rp}."
-    jobs = _get(f"/api/v1/repos/{rp}/actions/runs/{r['id']}/jobs").json()
-    if isinstance(jobs, dict):
-        jobs = jobs.get("workflow_jobs") or jobs.get("jobs") or []
+        return f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}."
+    jobs = _jobs(rp, r["id"])
     return "\n".join(
         f"job_id={j.get('id')}  {j.get('name')}  {j.get('status')}" for j in jobs
     ) or f"No jobs for run #{run_number}."
@@ -197,6 +244,8 @@ def forgejo_job_log(repo: str = "", job_id: int = 0, tail: int = 80) -> str:
     if not job_id:
         return "job_id is required - get it from forgejo_run_jobs."
     rp = _repo(repo)
+    if REPO_ALLOWLIST and not _job_in_recent_runs(rp, int(job_id)):
+        raise ValueError(f"job {job_id} was not found in the recent runs of {rp}")
     text = _get(f"/api/v1/repos/{rp}/actions/jobs/{job_id}/logs").text
     lines = text.strip().splitlines()
     return "\n".join(lines[-tail:]) if lines else "(empty log)"
@@ -208,10 +257,8 @@ def forgejo_run_log(repo: str = "", run_number: int = 0, tail: int = 80) -> str:
     rp = _repo(repo)
     r = _find_run(rp, run_number)
     if not r:
-        return f"No run #{run_number} in the last 100 runs of {rp}."
-    jobs = _get(f"/api/v1/repos/{rp}/actions/runs/{r['id']}/jobs").json()
-    if isinstance(jobs, dict):
-        jobs = jobs.get("workflow_jobs") or jobs.get("jobs") or []
+        return f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}."
+    jobs = _jobs(rp, r["id"])
     out = []
     for j in jobs:
         text = _get(f"/api/v1/repos/{rp}/actions/jobs/{j['id']}/logs").text
@@ -232,9 +279,7 @@ def forgejo_failed_logs(repo: str = "", tail: int = 60, scan: int = 20) -> str:
     bad = next((r for r in runs if r.get("status") not in ("success", "running", "waiting")), None)
     if not bad:
         return f"No failing run in the last {len(runs)} run(s) of {rp}."
-    jobs = _get(f"/api/v1/repos/{rp}/actions/runs/{bad['id']}/jobs").json()
-    if isinstance(jobs, dict):
-        jobs = jobs.get("workflow_jobs") or jobs.get("jobs") or []
+    jobs = _jobs(rp, bad["id"])
     failed = [j for j in jobs if j.get("status") not in ("success",)]
     out = [f"Newest failing run: {_fmt_run(bad)}"]
     for j in failed:
