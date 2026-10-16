@@ -1,14 +1,16 @@
-"""Tests for forgejo-mcp's SSE transport wiring and its Host-header policy.
-
-The tool functions need a live Forgejo and are not tested here.
+"""Tests for forgejo-mcp's transport wiring, Host-header policy, repo allowlist,
+and how refusals reach a client. The forge itself is stubbed.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 from pathlib import Path
 
 import pytest
+from mcp import Client
+from mcp.server.mcpserver.exceptions import ToolError
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -118,13 +120,13 @@ def test_padded_default_repo_matching_an_entry_passes(reload_with):
 def test_allowed_repo_resolves_and_other_is_refused(reload_with):
     mod = reload_with(REPO_ALLOWLIST="owner/allowed")
     assert mod._repo("owner/allowed") == "owner/allowed"
-    with pytest.raises(ValueError, match="owner/other.*REPO_ALLOWLIST"):
+    with pytest.raises(ToolError, match="owner/other.*REPO_ALLOWLIST"):
         mod._repo("owner/other")
 
 
 def test_refusal_does_not_list_allowed_repos(reload_with):
     mod = reload_with(REPO_ALLOWLIST="owner/secret-one,owner/secret-two")
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(ToolError) as exc:
         mod._repo("owner/other")
     assert "secret" not in str(exc.value)
 
@@ -161,22 +163,22 @@ def test_unset_allowlist_behaves_as_before(reload_with):
     mod = reload_with(FORGEJO_DEFAULT_REPO="owner/default")
     assert mod._repo("owner/anything") == "owner/anything"
     assert mod._repo("") == "owner/default"
-    with pytest.raises(ValueError, match="FORGEJO_DEFAULT_REPO"):
+    with pytest.raises(ToolError, match="FORGEJO_DEFAULT_REPO"):
         mod._repo("noslash")
 
 
 def test_dotdot_repo_is_rejected_in_allowlist_mode(reload_with):
     mod = reload_with(REPO_ALLOWLIST="owner/allowed")
-    with pytest.raises(ValueError, match="REPO_ALLOWLIST"):
+    with pytest.raises(ToolError, match="REPO_ALLOWLIST"):
         mod._repo("owner/..")
 
 
 def test_refused_repo_makes_no_http_request(reload_with, monkeypatch):
     mod = reload_with(REPO_ALLOWLIST="owner/allowed")
     calls = _stub_get(monkeypatch, mod, {1: [10]})
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         mod.forgejo_build_status(repo="owner/other")
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         mod.forgejo_job_log(repo="owner/other", job_id=10)
     assert calls == []
 
@@ -198,7 +200,7 @@ def test_job_log_stops_searching_at_the_first_match(reload_with, monkeypatch):
 def test_job_log_refuses_a_job_not_in_the_repos_runs(reload_with, monkeypatch):
     mod = reload_with(REPO_ALLOWLIST="owner/allowed")
     calls = _stub_get(monkeypatch, mod, {1: [10]})
-    with pytest.raises(ValueError, match="not found in the recent runs"):
+    with pytest.raises(ToolError, match="not found in the recent runs"):
         mod.forgejo_job_log(repo="owner/allowed", job_id=999)
     assert not any(c.endswith("/logs") for c in calls)
 
@@ -208,3 +210,65 @@ def test_job_log_without_allowlist_skips_the_job_search(reload_with, monkeypatch
     calls = _stub_get(monkeypatch, mod, {1: [10]})
     assert mod.forgejo_job_log(repo="owner/any", job_id=999) == "log line"
     assert calls == ["/api/v1/repos/owner/any/actions/jobs/999/logs"]
+
+
+# -- what a client receives ---------------------------------------------------
+
+
+def _call(mod, name: str, args: dict):
+    async def call():
+        async with Client(mod.app) as client:
+            return await client.call_tool(name, args)
+    return asyncio.run(call())
+
+
+@pytest.mark.parametrize("name, args, reason", [
+    ("forgejo_build_status", {"repo": "owner/other"}, "'owner/other' is not in REPO_ALLOWLIST"),
+    ("forgejo_build_status", {"repo": "noslash"}, "repo must be 'owner/name'"),
+    ("forgejo_run_info", {"repo": "owner/..", "run_number": 1}, "is not in REPO_ALLOWLIST"),
+    ("forgejo_job_log", {"repo": "owner/allowed", "job_id": 999},
+     "job 999 was not found in the recent runs of owner/allowed"),
+    ("forgejo_job_log", {"repo": "owner/allowed"}, "job_id is required"),
+    ("forgejo_run_info", {"repo": "owner/allowed", "run_number": 7}, "No run #7 in the last"),
+    ("forgejo_run_jobs", {"repo": "owner/allowed", "run_number": 7}, "No run #7 in the last"),
+    ("forgejo_run_log", {"repo": "owner/allowed", "run_number": 7}, "No run #7 in the last"),
+])
+def test_a_refusal_reaches_the_client_with_its_reason(
+        reload_with, monkeypatch, caplog, name, args, reason):
+    mod = reload_with(REPO_ALLOWLIST="owner/allowed")
+    _stub_get(monkeypatch, mod, {1: [10]})
+    with caplog.at_level("DEBUG"):
+        result = _call(mod, name, args)
+    assert result.is_error is True
+    assert reason in result.content[0].text
+    assert not [r for r in caplog.records if r.levelname == "ERROR" or r.exc_info]
+
+
+def test_a_normal_result_is_not_an_error(reload_with, monkeypatch):
+    mod = reload_with(REPO_ALLOWLIST="owner/allowed")
+    _stub_get(monkeypatch, mod, {1: [10]})
+    result = _call(mod, "forgejo_run_jobs", {"repo": "owner/allowed", "run_number": 1})
+    assert not result.is_error
+    assert "job_id=10" in result.content[0].text
+
+
+# -- Release version ------------------------------------------------
+
+
+def test_release_version_is_dev_when_unset(monkeypatch):
+    monkeypatch.delenv("FORGEJO_MCP_VERSION", raising=False)
+    assert srv.release_version() == "dev"
+
+
+def test_release_version_is_dev_when_blank(monkeypatch):
+    monkeypatch.setenv("FORGEJO_MCP_VERSION", "  ")
+    assert srv.release_version() == "dev"
+
+
+def test_release_version_reports_the_build_value(monkeypatch):
+    monkeypatch.setenv("FORGEJO_MCP_VERSION", "0.2.0-3-gabc1234")
+    assert srv.release_version() == "0.2.0-3-gabc1234"
+
+
+def test_server_reports_the_release_version():
+    assert srv.app.version == srv.release_version()

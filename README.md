@@ -90,5 +90,14 @@ Tests: `uv sync --frozen --extra dev && .venv/bin/python -m pytest tests/`
 
 Container image: `docker build .` (or `podman build .`).
 
+The server reports its release in the MCP `initialize` result
+(`serverInfo.version`). To stamp it, build from a checkout with tags:
+
+```
+docker build --build-arg FORGEJO_MCP_VERSION=$(git describe --tags --match 'forgejo-mcp-v*' | sed 's/^forgejo-mcp-v//') .
+```
+
+A build without it reports `dev`.
+
 Register it with an MCP client by pointing at `.venv/bin/python server.py` with
 the environment above.

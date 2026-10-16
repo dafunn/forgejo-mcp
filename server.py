@@ -31,6 +31,7 @@ from typing import Any
 
 import httpx
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 FORGEJO_URL = os.getenv("FORGEJO_URL", "").rstrip("/")
 FORGEJO_USER = os.getenv("FORGEJO_USER", "").strip()
@@ -66,7 +67,14 @@ _default = DEFAULT_REPO.strip().strip("/")
 if REPO_ALLOWLIST and _default and _default.casefold() not in REPO_ALLOWLIST:
     raise RuntimeError(f"FORGEJO_DEFAULT_REPO {_default!r} is not in REPO_ALLOWLIST")
 
-app = MCPServer("forgejo-mcp")
+
+def release_version() -> str:
+    """The release this build reports to clients: FORGEJO_MCP_VERSION,
+    stamped into the image from the forgejo-mcp-v* tag at build time, else `dev`."""
+    return os.environ.get("FORGEJO_MCP_VERSION", "").strip() or "dev"
+
+
+app = MCPServer("forgejo-mcp", version=release_version())
 
 
 def _token() -> str:
@@ -129,14 +137,19 @@ def _client() -> httpx.Client:
     )
 
 
+# A refusal or a lookup that finds nothing raises ToolError: the SDK returns its
+# message to the model as an error result and logs it without a traceback. Any
+# other exception is reported as a crash, with the reason withheld.
+
+
 def _repo(repo: str) -> str:
     r = (repo or DEFAULT_REPO).strip().strip("/")
     if not r or r.count("/") != 1:
-        raise ValueError(
+        raise ToolError(
             f"repo must be 'owner/name' (got {r!r}); set FORGEJO_DEFAULT_REPO or pass repo="
         )
     if REPO_ALLOWLIST and (".." in r or r.casefold() not in REPO_ALLOWLIST):
-        raise ValueError(f"repo {r!r} is not in REPO_ALLOWLIST")
+        raise ToolError(f"repo {r!r} is not in REPO_ALLOWLIST")
     return r
 
 
@@ -211,7 +224,7 @@ def forgejo_run_info(repo: str = "", run_number: int = 0) -> str:
     rp = _repo(repo)
     r = _find_run(rp, run_number)
     if not r:
-        return f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}."
+        raise ToolError(f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}.")
     jobs = _jobs(rp, r["id"])
     lines = [
         f"Run #{r.get('index_in_repo')} (id {r['id']}) - {r.get('status')}",
@@ -231,7 +244,7 @@ def forgejo_run_jobs(repo: str = "", run_number: int = 0) -> str:
     rp = _repo(repo)
     r = _find_run(rp, run_number)
     if not r:
-        return f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}."
+        raise ToolError(f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}.")
     jobs = _jobs(rp, r["id"])
     return "\n".join(
         f"job_id={j.get('id')}  {j.get('name')}  {j.get('status')}" for j in jobs
@@ -242,10 +255,10 @@ def forgejo_run_jobs(repo: str = "", run_number: int = 0) -> str:
 def forgejo_job_log(repo: str = "", job_id: int = 0, tail: int = 80) -> str:
     """Log for one job by JOB id (from forgejo_run_jobs), last `tail` lines."""
     if not job_id:
-        return "job_id is required - get it from forgejo_run_jobs."
+        raise ToolError("job_id is required - get it from forgejo_run_jobs.")
     rp = _repo(repo)
     if REPO_ALLOWLIST and not _job_in_recent_runs(rp, int(job_id)):
-        raise ValueError(f"job {job_id} was not found in the recent runs of {rp}")
+        raise ToolError(f"job {job_id} was not found in the recent runs of {rp}")
     text = _get(f"/api/v1/repos/{rp}/actions/jobs/{job_id}/logs").text
     lines = text.strip().splitlines()
     return "\n".join(lines[-tail:]) if lines else "(empty log)"
@@ -257,7 +270,7 @@ def forgejo_run_log(repo: str = "", run_number: int = 0, tail: int = 80) -> str:
     rp = _repo(repo)
     r = _find_run(rp, run_number)
     if not r:
-        return f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}."
+        raise ToolError(f"No run #{run_number} in the last {RUN_WINDOW} runs of {rp}.")
     jobs = _jobs(rp, r["id"])
     out = []
     for j in jobs:
