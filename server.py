@@ -305,16 +305,24 @@ def forgejo_failed_logs(repo: str = "", tail: int = 60, scan: int = 20) -> str:
 
 
 # -- Transport ----------------------------------------------------------------
-# stdio by default; `sse` serves the same tools over HTTP, for clients that
-# cannot spawn a process.
+# stdio by default; `streamable-http` serves the same tools over HTTP at `/mcp`,
+# for clients that cannot spawn a process.
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio").strip().lower()
 MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1").strip()
 MCP_PORT = int(os.getenv("MCP_PORT", "3000"))
 MCP_ALLOWED_HOSTS = [h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
 
 
+@app.custom_route("/healthz", methods=["GET"])
+async def healthz(_request):
+    """The probe target; a GET on `/mcp` opens a stream that stays open."""
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok")
+
+
 def _transport_security():
-    """Host-header policy for the SSE transport.
+    """Host-header policy for the HTTP transport.
 
     mcp 2.x enables DNS-rebinding protection with an empty allowed-host list, which
     rejects every request with a 421. The operator names the hostnames this server
@@ -324,23 +332,29 @@ def _transport_security():
 
     if not MCP_ALLOWED_HOSTS:
         raise RuntimeError(
-            "MCP_ALLOWED_HOSTS is required when MCP_TRANSPORT=sse - set the host:port "
-            "values clients use to address this server (e.g. 'forgejo-mcp:3000'), or '*' "
-            "to disable the Host-header check"
+            "MCP_ALLOWED_HOSTS is required when MCP_TRANSPORT=streamable-http - set the "
+            "host:port values clients use to address this server (e.g. 'forgejo-mcp:3000'), "
+            "or '*' to disable the Host-header check"
         )
     if MCP_ALLOWED_HOSTS == ["*"]:
         return TransportSecuritySettings(enable_dns_rebinding_protection=False)
     return TransportSecuritySettings(allowed_hosts=MCP_ALLOWED_HOSTS, allowed_origins=MCP_ALLOWED_HOSTS)
 
 
-def build_sse_app():
-    """Build the ASGI app for the SSE transport. A separate function so tests can construct it."""
-    return app.sse_app(host=MCP_HOST, transport_security=_transport_security())
+def build_http_app():
+    """Build the ASGI app for the streamable HTTP transport. A separate function so
+    tests can construct it. Stateless: each request is handled on its own, with no
+    session to keep."""
+    return app.streamable_http_app(
+        host=MCP_HOST, stateless_http=True, transport_security=_transport_security()
+    )
 
 
 if __name__ == "__main__":
-    if MCP_TRANSPORT == "sse":
-        app.run(transport="sse", host=MCP_HOST, port=MCP_PORT,
-                transport_security=_transport_security())
+    if MCP_TRANSPORT == "streamable-http":
+        app.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT,
+                stateless_http=True, transport_security=_transport_security())
+    elif MCP_TRANSPORT != "stdio":
+        raise SystemExit(f"MCP_TRANSPORT must be 'stdio' or 'streamable-http', got {MCP_TRANSPORT!r}")
     else:
         app.run()

@@ -20,9 +20,9 @@ Configured entirely from the environment.
 | `REPO_ALLOWLIST` | - | Comma-separated `owner/name` entries. When set, only these repos can be read (case-insensitive); any other repo is refused before a request is made. `FORGEJO_DEFAULT_REPO`, if set, must be on the list |
 | `FORGEJO_VERIFY_TLS` | `true` | Set `false` to skip certificate verification |
 | `FORGEJO_TIMEOUT` | `30` | Per-request timeout in seconds |
-| `MCP_TRANSPORT` | `stdio` | `sse` to serve over HTTP instead of a spawned pipe |
-| `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `3000` | SSE bind address |
-| `MCP_ALLOWED_HOSTS` | _(required for sse)_ | Host header values clients use, e.g. `forgejo-mcp:3000`; `*` disables the check |
+| `MCP_TRANSPORT` | `stdio` | `streamable-http` to serve over HTTP at `/mcp` (stateless; `/healthz` for probes) instead of a spawned pipe |
+| `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `3000` | HTTP bind address |
+| `MCP_ALLOWED_HOSTS` | _(required for streamable-http)_ | Host header values clients use, e.g. `forgejo-mcp:3000`; `*` disables the check |
 
 Resolution order is `FORGEJO_TOKEN_CMD` -> `FORGEJO_TOKEN` -> `FORGEJO_TOKEN_FILE`.
 A token command that exits non-zero is fatal; it never falls back to another
@@ -71,16 +71,16 @@ FORGEJO_URL=https://forge.example.com \
   .venv/bin/python server.py
 ```
 
-Over SSE, for a client that cannot spawn a process:
+Over HTTP, for a client that cannot spawn a process:
 
 ```bash
 FORGEJO_URL=https://forge.example.com \
   FORGEJO_TOKEN_FILE=/run/secrets/forgejo-token \
-  MCP_TRANSPORT=sse MCP_HOST=0.0.0.0 MCP_ALLOWED_HOSTS=forgejo-mcp:3000 \
+  MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_ALLOWED_HOSTS=forgejo-mcp:3000 \
   .venv/bin/python server.py
 ```
 
-`MCP_ALLOWED_HOSTS` has no default; over SSE the server refuses to start
+`MCP_ALLOWED_HOSTS` has no default; over HTTP the server refuses to start
 without it.
 
 Requires Python 3.14 and [uv](https://docs.astral.sh/uv/). `uv sync --frozen`
@@ -90,7 +90,7 @@ Tests: `uv sync --frozen --extra dev && .venv/bin/python -m pytest tests/`
 
 Container image: `docker build .` (or `podman build .`).
 
-The server reports its release in the MCP `initialize` result
+The server reports its release in its MCP server info
 (`serverInfo.version`). To stamp it, build from a checkout with tags:
 
 ```

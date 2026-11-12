@@ -41,31 +41,96 @@ def test_stdio_is_the_default(reload_with):
     assert mod.MCP_TRANSPORT == "stdio"
 
 
-def test_sse_requires_allowed_hosts(reload_with):
+def test_http_requires_allowed_hosts(reload_with):
     """An empty list is mcp's default and rejects every request; refuse to start instead."""
-    mod = reload_with(MCP_TRANSPORT="sse", MCP_ALLOWED_HOSTS="")
+    mod = reload_with(MCP_TRANSPORT="streamable-http", MCP_ALLOWED_HOSTS="")
     with pytest.raises(RuntimeError, match="MCP_ALLOWED_HOSTS is required"):
         mod._transport_security()
 
 
 def test_allowed_hosts_are_passed_through(reload_with):
-    mod = reload_with(MCP_TRANSPORT="sse", MCP_ALLOWED_HOSTS="forgejo-mcp:3000,localhost:3000")
+    mod = reload_with(MCP_TRANSPORT="streamable-http", MCP_ALLOWED_HOSTS="forgejo-mcp:3000,localhost:3000")
     settings = mod._transport_security()
     assert settings.enable_dns_rebinding_protection is True
     assert settings.allowed_hosts == ["forgejo-mcp:3000", "localhost:3000"]
 
 
 def test_wildcard_disables_the_host_check(reload_with):
-    mod = reload_with(MCP_TRANSPORT="sse", MCP_ALLOWED_HOSTS="*")
+    mod = reload_with(MCP_TRANSPORT="streamable-http", MCP_ALLOWED_HOSTS="*")
     assert mod._transport_security().enable_dns_rebinding_protection is False
 
 
-def test_build_sse_app_constructs(reload_with):
+def test_build_http_app_constructs(reload_with):
     """Catches a transport API mismatch that the tool functions never touch."""
-    mod = reload_with(MCP_TRANSPORT="sse", MCP_HOST="0.0.0.0", MCP_ALLOWED_HOSTS="forgejo-mcp:3000")
-    app = mod.build_sse_app()
+    mod = reload_with(MCP_TRANSPORT="streamable-http", MCP_HOST="0.0.0.0", MCP_ALLOWED_HOSTS="forgejo-mcp:3000")
+    app = mod.build_http_app()
     paths = [getattr(r, "path", None) for r in app.routes]
-    assert "/sse" in paths
+    assert "/mcp" in paths and "/healthz" in paths
+
+
+def _http(app, method, path, headers=None, json=None):
+    """One request to `app` in-process, with its lifespan (the session manager) running."""
+    import httpx2
+
+    async def _call():
+        async with app.router.lifespan_context(app):
+            async with httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                return await client.request(method, path, headers=headers or {}, json=json)
+
+    return asyncio.run(_call())
+
+
+def _mcp_request(app, method, params=None):
+    """POST one 2026-07-28 request: self-contained, no initialize and no session.
+    The method, and for tools/call the tool name, are repeated in headers."""
+    meta = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2026-07-28",
+        "Mcp-Method": method,
+    }
+    if params and "name" in params:
+        headers["Mcp-Name"] = params["name"]
+    return _http(
+        app, "POST", "/mcp",
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": 1, "method": method,
+              "params": {**(params or {}), "_meta": meta}},
+    )
+
+
+def test_http_app_serves_tools_list_at_mcp(reload_with):
+    mod = reload_with(MCP_TRANSPORT="streamable-http", MCP_ALLOWED_HOSTS="test")
+    resp = _mcp_request(mod.build_http_app(), "tools/list")
+    assert resp.status_code == 200
+    assert "forgejo_build_status" in {t["name"] for t in resp.json()["result"]["tools"]}
+
+
+def test_http_app_marks_a_refusal_as_an_error_result(reload_with):
+    mod = reload_with(MCP_TRANSPORT="streamable-http", MCP_ALLOWED_HOSTS="test",
+                      REPO_ALLOWLIST="owner/a")
+    resp = _mcp_request(mod.build_http_app(), "tools/call",
+                        {"name": "forgejo_build_status", "arguments": {"repo": "owner/x"}})
+    result = resp.json()["result"]
+    assert result["isError"] is True
+    assert "not in REPO_ALLOWLIST" in result["content"][0]["text"]
+
+
+def test_http_app_rejects_an_unlisted_host(reload_with):
+    mod = reload_with(MCP_TRANSPORT="streamable-http", MCP_ALLOWED_HOSTS="forgejo-mcp:3000")
+    assert _mcp_request(mod.build_http_app(), "tools/list").status_code == 421
+
+
+def test_http_app_answers_healthz(reload_with):
+    mod = reload_with(MCP_TRANSPORT="streamable-http", MCP_ALLOWED_HOSTS="test")
+    resp = _http(mod.build_http_app(), "GET", "/healthz")
+    assert resp.status_code == 200 and resp.text == "ok"
 
 
 class _Resp:
